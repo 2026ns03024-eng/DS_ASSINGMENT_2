@@ -73,6 +73,55 @@ sudo ufw allow 5000/tcp
 
 Check connectivity: `ping` between VMs; after starting a node, `nc -zv <peer-ip> 5000`.
 
+### Common VM mistakes
+
+1. **Same `--id` on every machine** — each VM needs a **different** id (`p1`, `p2`, `p3`, `p4`). If all are `p2`, every node owns only `sensor-2` and the demo is wrong.
+2. **`--master` must match the master VM’s `advertise-host:port`** — only that node should print `is_master=True`.
+3. **Start the master VM first**, then the others (so join messages have someone listening).
+
+### Troubleshooting `[Errno 113] No route to host`
+
+The OS cannot send packets to that IP (routing/firewall/lab network), not a bug in `node.py`.
+
+On **VM A**, test **VM B** (replace with real peer IPs):
+
+```bash
+ping -c 3 10.3.21.110
+nc -zv 10.3.23.248 5000   # after master is running
+```
+
+If `ping` fails, fix lab networking first (wrong IP, VMs on isolated networks, or ask Prayogshala support). If `ping` works but `nc` fails, check the node is running and firewall.
+
+### Example: three lab IPs (add a 4th VM for the assignment minimum)
+
+Master **10.3.23.248** = `p1`. Peers list must include **every other** node’s `IP:5000`.
+
+**10.3.23.248 — p1 (master), start first:**
+
+```bash
+python3 node.py --id p1 --host 0.0.0.0 --port 5000 --advertise-host 10.3.23.248 \
+  --peers 10.3.21.110:5000,10.3.23.15:5000,10.3.23.XXX:5000 \
+  --master 10.3.23.248:5000
+```
+
+**10.3.21.110 — p2:**
+
+```bash
+python3 node.py --id p2 --host 0.0.0.0 --port 5000 --advertise-host 10.3.21.110 \
+  --peers 10.3.23.248:5000,10.3.23.15:5000,10.3.23.XXX:5000 \
+  --master 10.3.23.248:5000
+```
+
+**10.3.23.15 — p3:**
+
+```bash
+python3 node.py --id p3 --host 0.0.0.0 --port 5000 --advertise-host 10.3.23.15 \
+  --peers 10.3.23.248:5000,10.3.21.110:5000,10.3.23.XXX:5000 \
+  --master 10.3.23.248:5000
+```
+
+Replace `10.3.23.XXX` with your 4th VM’s IP. Each node should show `local resources: ['sensor-N']` matching its id.
+
 ### Git on each VM
 
 ```bash

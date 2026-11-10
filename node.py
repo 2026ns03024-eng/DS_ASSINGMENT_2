@@ -2,6 +2,7 @@
 """Distributed peer node with optional cluster master/worker compute."""
 
 import argparse
+import errno
 import json
 import socket
 import sys
@@ -93,7 +94,15 @@ def ping_peer(host: str, port: int) -> str:
                     return "ok"
     except ConnectionRefusedError:
         return "refused"
-    except OSError:
+    except OSError as exc:
+        if exc.errno in (
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+            errno.EHOSTDOWN,
+            errno.ETIMEDOUT,
+            errno.ENETDOWN,
+        ):
+            return "transient"
         return "error"
     except json.JSONDecodeError:
         return "error"
@@ -537,15 +546,27 @@ class Node:
                             self.peers[pid]["last_seen"] = now
                             self.peers[pid]["fail_count"] = 0
                 elif status == "refused":
+                    self.vlog("peer", f"heartbeat {pid} connection refused (removing)")
                     to_remove.append(pid)
+                elif status == "transient":
+                    self.vlog(
+                        "peer",
+                        f"heartbeat {pid} unreachable (No route / timeout — keeping peer)",
+                    )
                 else:
                     with self.lock:
                         if pid in self.peers:
                             self.peers[pid]["fail_count"] = self.peers[pid].get("fail_count", 0) + 1
-                            if self.peers[pid]["fail_count"] >= 3:
+                            if self.peers[pid]["fail_count"] >= 5:
+                                self.vlog("peer", f"heartbeat {pid} failed 5x (removing)")
                                 to_remove.append(pid)
             for pid in to_remove:
                 self.remove_peer(pid)
+            with self.lock:
+                empty = len(self.peers) == 0
+            if empty and self.bootstrap_peers:
+                self.vlog("peer", "no peers known — re-sending join to bootstrap list")
+                self._bootstrap_join()
 
     def lookup_resource(self, key: str, timeout: float = 10.0) -> Optional[dict]:
         if key in self.resources:
