@@ -131,7 +131,9 @@ class Node:
         bootstrap_peers: list[PeerAddr],
         master_addr: PeerAddr,
         bind_host: Optional[str] = None,
+        verbose: bool = True,
     ):
+        self.verbose = verbose
         self.bind_host = bind_host if bind_host is not None else host
         self.bootstrap_peers = bootstrap_peers
         self.node_id = node_id
@@ -153,6 +155,10 @@ class Node:
         self._server_sock: Optional[socket.socket] = None
         self._threads: list[threading.Thread] = []
 
+    def vlog(self, tag: str, message: str) -> None:
+        if self.verbose:
+            print(f"[{self.node_id}][{tag}] {message}", flush=True)
+
     def peer_list(self) -> list[dict]:
         with self.lock:
             return [dict(p) for p in self.peers.values()]
@@ -172,14 +178,14 @@ class Node:
                 "last_seen": time.time(),
                 "fail_count": 0,
             }
-        print(f"[peer] joined known peer {peer_id} at {host}:{port}", flush=True)
+        self.vlog("peer", f"learned peer {peer_id} at {host}:{port}")
         return True
 
     def remove_peer(self, peer_id: str) -> None:
         with self.lock:
             if peer_id in self.peers:
                 del self.peers[peer_id]
-                print(f"[peer] removed {peer_id}", flush=True)
+                self.vlog("peer", f"removed {peer_id}")
 
     def all_peer_addrs_except(self, skip_id: Optional[str] = None) -> list[PeerAddr]:
         out = []
@@ -236,6 +242,7 @@ class Node:
         for host, port in self.bootstrap_peers:
             if addr_key((host, port)) == addr_key(self.addr):
                 continue
+            self.vlog("peer", f"send join -> {host}:{port}")
             send_message(host, port, join_msg)
 
     def _accept_loop(self) -> None:
@@ -309,9 +316,12 @@ class Node:
             host = msg["host"]
             port = int(msg["port"])
             join_key = f"{pid}:{host}:{port}"
+            self.vlog("peer", f"recv join from {pid} at {host}:{port}")
             if join_key not in self.seen_joins:
                 self.seen_joins.add(join_key)
                 if self.add_peer(pid, host, port):
+                    targets = self.all_peer_addrs_except(pid)
+                    self.vlog("peer", f"gossip join {pid} -> {len(targets)} peer(s)")
                     forward = dict(msg)
                     self.broadcast(forward, skip_id=pid)
             else:
@@ -319,6 +329,7 @@ class Node:
             return None
 
         if mtype == "leave":
+            self.vlog("peer", f"recv leave from {msg['id']}")
             self.remove_peer(msg["id"])
             return None
 
@@ -328,11 +339,19 @@ class Node:
         if mtype == "lookup":
             req_id = msg["req_id"]
             key = msg["key"]
+            from_id = msg.get("from_id", "?")
             with self.lock:
                 if req_id in self.seen_lookups:
+                    self.vlog("lookup", f"dup req={req_id} key={key} (drop)")
                     return None
                 self.seen_lookups.add(req_id)
+            self.vlog("lookup", f"recv flood req={req_id} key={key} from={from_id}")
             if key in self.resources:
+                reply_to = msg["reply_to"]
+                self.vlog(
+                    "lookup",
+                    f"HIT key={key} -> reply to {reply_to} (owner {self.node_id})",
+                )
                 hit = {
                     "type": "lookup_hit",
                     "req_id": req_id,
@@ -343,12 +362,17 @@ class Node:
                 reply_host, reply_port = parse_host_port(msg["reply_to"])
                 send_message(reply_host, reply_port, hit)
                 return None
+            targets = self.all_peer_addrs_except(msg.get("from_id"))
+            self.vlog("lookup", f"forward req={req_id} key={key} -> {len(targets)} peer(s)")
             fwd = dict(msg)
             self.broadcast(fwd, skip_id=msg.get("from_id"))
             return None
 
         if mtype == "lookup_hit":
             req_id = msg["req_id"]
+            owner = msg.get("owner_id", "?")
+            key = msg.get("key", "?")
+            self.vlog("lookup", f"recv answer req={req_id} key={key} owner={owner}")
             with self.lock:
                 self.lookup_results[req_id] = msg
                 ev = self.pending_lookups.get(req_id)
@@ -362,15 +386,35 @@ class Node:
             start = int(msg["start"])
             end = int(msg["end"])
             job_id = msg.get("job_id", str(uuid.uuid4())[:8])
+            who = msg.get("from_id", "?")
+            self.vlog(
+                "cluster",
+                f"master recv job={job_id} range=[{start},{end}] from={who}",
+            )
             result = self._run_cluster_job(job_id, start, end)
+            self.vlog(
+                "cluster",
+                f"master done job={job_id} total={result.get('total_primes')} "
+                f"workers={result.get('workers_used')}",
+            )
             return result
 
         if mtype == "worker_task":
             start = int(msg["start"])
             end = int(msg["end"])
+            job_id = msg.get("job_id", "?")
+            chunk = msg.get("chunk_id", "?")
+            self.vlog(
+                "cluster",
+                f"worker task job={job_id} chunk={chunk} range=[{start},{end}]",
+            )
             t0 = time.time()
             cnt = count_primes(start, end)
             elapsed = time.time() - t0
+            self.vlog(
+                "cluster",
+                f"worker done job={job_id} chunk={chunk} count={cnt} ({elapsed:.3f}s)",
+            )
             return {
                 "type": "worker_result",
                 "job_id": msg.get("job_id"),
@@ -522,6 +566,11 @@ class Node:
             "from_id": self.node_id,
             "reply_to": addr_key(self.addr),
         }
+        targets = self.all_peer_addrs_except(None)
+        self.vlog(
+            "lookup",
+            f"start flood req={req_id} key={key} -> {len(targets)} peer(s)",
+        )
         self.broadcast(msg)
         if ev.wait(timeout):
             with self.lock:
@@ -621,6 +670,11 @@ def main() -> None:
         help="comma-separated host:port bootstrap peers",
     )
     parser.add_argument("--master", required=True, help="cluster master host:port")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="hide peer/lookup/cluster activity logs (errors still print)",
+    )
     args = parser.parse_args()
 
     bootstrap_peers: list[PeerAddr] = []
@@ -640,7 +694,15 @@ def main() -> None:
     master_addr = parse_host_port(args.master)
     bind_host = args.host if args.host else "0.0.0.0"
 
-    node = Node(args.id, adv, args.port, bootstrap_peers, master_addr, bind_host=bind_host)
+    node = Node(
+        args.id,
+        adv,
+        args.port,
+        bootstrap_peers,
+        master_addr,
+        bind_host=bind_host,
+        verbose=not args.quiet,
+    )
     node.start()
     try:
         node.repl()

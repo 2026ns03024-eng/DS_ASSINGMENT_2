@@ -25,6 +25,8 @@ Python 3 only — no extra packages. Each machine runs `node.py` once. Every nod
 - `compute <start> <end>` — send range to cluster master (e.g. `compute 1 200000`)
 - `quit` — broadcast leave and exit
 
+While a node is running, its **terminal shows activity** from every other node that talks to it (join gossip, lookup flood / forward / hit, cluster jobs). Each line is tagged with the node id, e.g. `[p2][lookup] recv flood ...`. Heartbeats are silent. Use `--quiet` to turn activity logs off.
+
 ## Run on four VMs (same LAN)
 
 Replace `192.168.x.x` with your VM IPs. **VM1** is master. Start VM1 first, then the others.
