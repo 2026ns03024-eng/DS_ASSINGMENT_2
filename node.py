@@ -241,6 +241,21 @@ class Node:
             except OSError:
                 pass
 
+    def _welcome_peers(self) -> list[dict]:
+        out = [{"id": self.node_id, "host": self.host, "port": self.port}]
+        with self.lock:
+            for p in self.peers.values():
+                out.append(
+                    {"id": p["id"], "host": p["host"], "port": int(p["port"])}
+                )
+        return out
+
+    def _ingest_join_welcome(self, resp: dict) -> None:
+        if resp.get("type") != "join_welcome":
+            return
+        for p in resp.get("peers", []):
+            self.add_peer(p["id"], p["host"], int(p["port"]))
+
     def _bootstrap_join(self) -> None:
         join_msg = {
             "type": "join",
@@ -252,7 +267,13 @@ class Node:
             if addr_key((host, port)) == addr_key(self.addr):
                 continue
             self.vlog("peer", f"send join -> {host}:{port}")
-            send_message(host, port, join_msg)
+            resp = send_and_receive(host, port, join_msg, timeout=8.0)
+            if resp:
+                self._ingest_join_welcome(resp)
+                self.vlog(
+                    "peer",
+                    f"welcome from {host}:{port} ({len(resp.get('peers', []))} peer(s) in list)",
+                )
 
     def _accept_loop(self) -> None:
         assert self._server_sock
@@ -306,7 +327,7 @@ class Node:
                 reply = self._dispatch(msg, conn)
                 if reply is not None:
                     conn.sendall((json.dumps(reply) + "\n").encode())
-                    if msg.get("type") in ("compute_job", "worker_task"):
+                    if msg.get("type") in ("compute_job", "worker_task", "join"):
                         conn.close()
                         return
         except (OSError, json.JSONDecodeError) as exc:
@@ -335,7 +356,7 @@ class Node:
                     self.broadcast(forward, skip_id=pid)
             else:
                 self.add_peer(pid, host, port)
-            return None
+            return {"type": "join_welcome", "peers": self._welcome_peers()}
 
         if mtype == "leave":
             self.vlog("peer", f"recv leave from {msg['id']}")
@@ -565,7 +586,7 @@ class Node:
             with self.lock:
                 empty = len(self.peers) == 0
             if empty and self.bootstrap_peers:
-                self.vlog("peer", "no peers known — re-sending join to bootstrap list")
+                self.vlog("peer", "no peers known — re-join bootstrap list")
                 self._bootstrap_join()
 
     def lookup_resource(self, key: str, timeout: float = 10.0) -> Optional[dict]:
